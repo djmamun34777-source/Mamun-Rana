@@ -35,6 +35,7 @@ data class WalkieUiState(
     val micPermissionGranted: Boolean = false,
     val batteryOptimizationIgnored: Boolean = true,
     val batteryPercent: Int = 100,
+    val isCharging: Boolean = false,
     val signalBars: Int = 0,
     val networkTransport: NetworkTransport = NetworkTransport.OFFLINE,
     val volumePercent: Int = 75,
@@ -105,6 +106,10 @@ class WalkieViewModel(
 
     fun stepVolume(deltaPercent: Int) = runtime.stepVolume(deltaPercent)
 
+    fun syncSystemVolume() = runtime.syncSystemVolume()
+
+    fun notifyUser(message: String) = runtime.notifyUser(message)
+
     fun onPttPressed() = runtime.onPttPressed()
 
     fun onPttReleased() = runtime.onPttReleased()
@@ -126,16 +131,12 @@ class WalkieViewModel(
         stunText: String,
         turnUrl: String,
         turnUsername: String,
-        turnCredential: String,
-        sfuEnabled: Boolean,
-        sfuUrl: String
+        turnCredential: String
     ) = runtime.saveIceServerConfig(
         stunText = stunText,
         turnUrl = turnUrl,
         turnUsername = turnUsername,
-        turnCredential = turnCredential,
-        sfuEnabled = sfuEnabled,
-        sfuUrl = sfuUrl
+        turnCredential = turnCredential
     )
 
     fun setKeepActiveInBackground(enabled: Boolean) = runtime.setKeepActiveInBackground(enabled)

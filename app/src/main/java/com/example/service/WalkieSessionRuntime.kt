@@ -9,7 +9,6 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.R
 import com.example.audio.AudioTransportEngine
-import com.example.audio.AudioTransportTopology
 import com.example.audio.RadioTonePlayer
 import com.example.audio.SignalingSender
 import com.example.audio.WalkieAudioFocusManager
@@ -186,6 +185,7 @@ class WalkieSessionRuntime(context: Context) {
                 _uiState.update { state ->
                     state.copy(
                         batteryPercent = hw.batteryPercent,
+                        isCharging = hw.isCharging,
                         signalBars = hw.signalBars,
                         networkTransport = hw.networkTransport
                     )
@@ -217,6 +217,7 @@ class WalkieSessionRuntime(context: Context) {
 
         runtimeScope.launch {
             audioEngine.telemetry.collect { peerTelemetry ->
+                audioFocusManager.ownAudioCaptureActive = peerTelemetry.hasActiveAudioCapture
                 _uiState.update { it.copy(audioTelemetry = peerTelemetry) }
             }
         }
@@ -566,6 +567,8 @@ class WalkieSessionRuntime(context: Context) {
 
     fun adjustVolume(percent: Int) = audioFocusManager.setVolumePercent(percent)
     fun stepVolume(deltaPercent: Int) = audioFocusManager.stepVolume(deltaPercent)
+    fun syncSystemVolume() = audioFocusManager.refreshSystemVolume()
+    fun notifyUser(message: String) = showMessage(message)
 
     // --- PUSH-TO-TALK (PTT) ---
 
@@ -754,9 +757,7 @@ class WalkieSessionRuntime(context: Context) {
         stunText: String,
         turnUrl: String,
         turnUsername: String,
-        turnCredential: String,
-        sfuEnabled: Boolean,
-        sfuUrl: String
+        turnCredential: String
     ) {
         val stuns = stunText.lines().map { it.trim() }.filter { it.isNotBlank() }
         runtimeScope.launch {
@@ -766,9 +767,9 @@ class WalkieSessionRuntime(context: Context) {
                 turnUrl = turnUrl,
                 turnUsername = turnUsername,
                 turnCredential = turnCredential,
-                sfuEnabled = sfuEnabled,
-                sfuUrl = sfuUrl
-            ).onSuccess { showMessage("STUN / TURN / SFU configuration saved") }
+                sfuEnabled = false,
+                sfuUrl = ""
+            ).onSuccess { showMessage("STUN / TURN configuration saved") }
                 .onFailure { err -> showMessage(err.localizedMessage ?: "Failed to save ICE server config") }
             _uiState.update { it.copy(isBusySaving = false) }
         }
@@ -933,10 +934,9 @@ class WalkieSessionRuntime(context: Context) {
             state.connectionStatus == ConnectionStatus.CONNECTED -> "Active in Background • $modeLabel"
             else -> "Connecting in Background…"
         }
-        val topologySuffix = if (state.audioTelemetry.topology == AudioTransportTopology.SFU_READY) " [SFU]" else ""
         WalkieForegroundService.updateStatus(
             context = appContext,
-            title = "Mamun Walkie Talkie$topologySuffix",
+            title = "Mamun Walkie Talkie",
             body = statusText,
             transmitting = state.isTransmitting
         )

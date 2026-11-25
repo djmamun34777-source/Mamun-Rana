@@ -54,14 +54,27 @@ jobs:
 
       - name: Prepare .env for Secrets Gradle Plugin
         env:
+          GMAIL_SMTP_EMAIL: ${{ secrets.GMAIL_SMTP_EMAIL }}
+          GMAIL_SMTP_APP_PASSWORD: ${{ secrets.GMAIL_SMTP_APP_PASSWORD }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           OTP_FROM_EMAIL: ${{ secrets.OTP_FROM_EMAIL }}
         run: |
-          if [ ! -f .env ]; then
-            cp .env.example .env || touch .env
+          cp .env.example .env || touch .env
+          if [ -n "$GMAIL_SMTP_EMAIL" ]; then
+            sed -i '/^GMAIL_SMTP_EMAIL=/d' .env
+            printf '\nGMAIL_SMTP_EMAIL=%s\n' "$GMAIL_SMTP_EMAIL" >> .env
+          fi
+          if [ -n "$GMAIL_SMTP_APP_PASSWORD" ]; then
+            sed -i '/^GMAIL_SMTP_APP_PASSWORD=/d' .env
+            printf 'GMAIL_SMTP_APP_PASSWORD=%s\n' "$GMAIL_SMTP_APP_PASSWORD" >> .env
           fi
           if [ -n "$RESEND_API_KEY" ]; then
-            printf 'RESEND_API_KEY=%s\nOTP_FROM_EMAIL=%s\n' "$RESEND_API_KEY" "${OTP_FROM_EMAIL:-onboarding@resend.dev}" > .env
+            sed -i '/^RESEND_API_KEY=/d' .env
+            printf 'RESEND_API_KEY=%s\n' "$RESEND_API_KEY" >> .env
+          fi
+          if [ -n "$OTP_FROM_EMAIL" ]; then
+            sed -i '/^OTP_FROM_EMAIL=/d' .env
+            printf 'OTP_FROM_EMAIL=%s\n' "$OTP_FROM_EMAIL" >> .env
           fi
 
       - name: Decode Release Keystore (if configured in GitHub Secrets)

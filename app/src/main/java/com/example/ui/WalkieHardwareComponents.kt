@@ -1,11 +1,6 @@
 package com.example.ui
 
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -117,18 +112,18 @@ import kotlin.math.sin
 fun RuggedWalkieTopHeader(
     isTransmitting: Boolean,
     isPoweredOn: Boolean,
+    localAudioLevel: Float,
     onTopKnobClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val infinite = rememberInfiniteTransition(label = "rf_wave")
-    val pulse by infinite.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(650, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "rf_pulse"
+    val txSignalStrength by animateFloatAsState(
+        targetValue = if (isPoweredOn && isTransmitting) {
+            (0.28f + 0.72f * localAudioLevel.coerceIn(0f, 1f))
+        } else {
+            0f
+        },
+        animationSpec = tween(durationMillis = 90),
+        label = "real_tx_signal"
     )
 
     Column(modifier = modifier.fillMaxWidth()) {
@@ -176,11 +171,11 @@ fun RuggedWalkieTopHeader(
                             strokeWidth = 3f
                         )
                     }
-                    // Active TX RF halo near antenna tip
-                    if (isTransmitting && isPoweredOn) {
+                    // Active TX RF halo driven by real microphone PCM amplitude
+                    if (txSignalStrength > 0.01f) {
                         drawCircle(
-                            color = PttTxRed.copy(alpha = 0.45f * pulse),
-                            radius = w * 0.36f,
+                            color = PttTxRed.copy(alpha = 0.55f * txSignalStrength),
+                            radius = w * (0.24f + 0.18f * txSignalStrength),
                             center = Offset(w * 0.45f, h * 0.25f)
                         )
                     }
@@ -208,7 +203,7 @@ fun RuggedWalkieTopHeader(
                         .background(
                             when {
                                 !isPoweredOn -> Color(0xFF2B313A)
-                                isTransmitting -> PttTxRed.copy(alpha = 0.7f + 0.3f * pulse)
+                                isTransmitting -> PttTxRed.copy(alpha = (0.55f + 0.45f * txSignalStrength).coerceIn(0.55f, 1f))
                                 else -> BrandAmber
                             }
                         )
@@ -375,20 +370,26 @@ fun BacklitLcdDisplay(
     privateTargetName: String,
     onlineInChannel: Int,
     batteryPercent: Int,
+    isCharging: Boolean,
     signalBars: Int,
     networkTransport: NetworkTransport,
     isTransmitting: Boolean,
     activeSpeakerName: String,
     isChannelBusyByOther: Boolean,
     micPermissionGranted: Boolean,
+    localAudioLevel: Float,
+    remoteAudioLevel: Float,
     modifier: Modifier = Modifier
 ) {
-    val infinite = rememberInfiniteTransition(label = "lcd_anim")
-    val vuPhase by infinite.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(420, easing = LinearEasing), RepeatMode.Reverse),
-        label = "vu_phase"
+    val liveVuLevel by animateFloatAsState(
+        targetValue = when {
+            !isPoweredOn -> 0f
+            isTransmitting -> localAudioLevel.coerceIn(0f, 1f)
+            isChannelBusyByOther -> remoteAudioLevel.coerceIn(0f, 1f)
+            else -> 0f
+        },
+        animationSpec = tween(durationMillis = 80),
+        label = "real_vu_level"
     )
 
     val lcdBg = if (isPoweredOn) {
@@ -499,8 +500,8 @@ fun BacklitLcdDisplay(
                         )
                         Spacer(Modifier.width(6.dp))
                         Icon(
-                            imageVector = if (batteryPercent >= 95) Icons.Default.BatteryChargingFull else Icons.Default.BatteryFull,
-                            contentDescription = "Battery $batteryPercent percent",
+                            imageVector = if (isCharging) Icons.Default.BatteryChargingFull else Icons.Default.BatteryFull,
+                            contentDescription = if (isCharging) "Battery $batteryPercent percent charging" else "Battery $batteryPercent percent",
                             tint = inkColor,
                             modifier = Modifier.size(16.dp)
                         )
@@ -588,7 +589,7 @@ fun BacklitLcdDisplay(
                     horizontalArrangement = Arrangement.Center
                 ) {
                     if (isPoweredOn && (isTransmitting || isChannelBusyByOther)) {
-                        AudioActivityMiniBars(phase = vuPhase, color = inkColor)
+                        AudioActivityMiniBars(level = liveVuLevel, color = inkColor)
                         Spacer(Modifier.width(8.dp))
                     } else {
                         Box(
@@ -613,7 +614,7 @@ fun BacklitLcdDisplay(
 
                     if (isPoweredOn && (isTransmitting || isChannelBusyByOther)) {
                         Spacer(Modifier.width(8.dp))
-                        AudioActivityMiniBars(phase = 1f - vuPhase, color = inkColor)
+                        AudioActivityMiniBars(level = liveVuLevel, mirrored = true, color = inkColor)
                     } else {
                         Spacer(Modifier.width(8.dp))
                         Box(
@@ -653,17 +654,27 @@ private fun SignalMeterBars(
 }
 
 @Composable
-private fun AudioActivityMiniBars(phase: Float, color: Color) {
+private fun AudioActivityMiniBars(
+    level: Float,
+    color: Color,
+    mirrored: Boolean = false
+) {
+    val clamped = level.coerceIn(0f, 1f)
+    val rawFactors = listOf(
+        (0.20f + 0.80f * (clamped * 1.15f).coerceAtMost(1f)),
+        (0.20f + 0.80f * clamped),
+        (0.20f + 0.80f * (clamped * 0.72f))
+    )
+    val factors = if (mirrored) rawFactors.reversed() else rawFactors
     Row(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        val factors = listOf(0.4f + 0.6f * phase, 1f - 0.5f * phase, 0.35f + 0.65f * phase)
         factors.forEach { f ->
             Box(
                 modifier = Modifier
                     .width(3.dp)
-                    .height((12f * f).dp)
+                    .height((13f * f).dp)
                     .clip(RoundedCornerShape(1.dp))
                     .background(color)
             )
@@ -809,20 +820,19 @@ fun ChannelRockerSwitch(
 }
 
 /**
- * Horizontal Recessed Acoustic Speaker Grill (pulses subtly during active RX audio).
+ * Horizontal Recessed Acoustic Speaker Grill (responds directly to real incoming WebRTC RX audio level).
  */
 @Composable
 fun AcousticSpeakerGrill(
     isReceivingAudio: Boolean,
+    remoteAudioLevel: Float,
     isPoweredOn: Boolean,
     modifier: Modifier = Modifier
 ) {
-    val infinite = rememberInfiniteTransition(label = "speaker_rx")
-    val rxPulse by infinite.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(380), RepeatMode.Reverse),
-        label = "speaker_pulse"
+    val smoothedRx by animateFloatAsState(
+        targetValue = if (isPoweredOn && isReceivingAudio) remoteAudioLevel.coerceIn(0f, 1f) else 0f,
+        animationSpec = tween(durationMillis = 90),
+        label = "real_speaker_rx"
     )
 
     Column(
@@ -833,6 +843,12 @@ fun AcousticSpeakerGrill(
     ) {
         val widths = listOf(0.88f, 1f, 1f, 1f, 1f, 0.88f)
         widths.forEachIndexed { idx, frac ->
+            val slotWeight = when (idx) {
+                2, 3 -> 1f
+                1, 4 -> 0.55f
+                else -> 0.25f
+            }
+            val slotGlow = (smoothedRx * slotWeight).coerceIn(0f, 1f)
             Box(
                 modifier = Modifier
                     .fillMaxWidth(frac)
@@ -840,9 +856,9 @@ fun AcousticSpeakerGrill(
                     .clip(RoundedCornerShape(4.dp))
                     .background(Color(0xFF06080B))
                     .border(
-                        width = 0.8.dp,
-                        color = if (isPoweredOn && isReceivingAudio && (idx == 2 || idx == 3)) {
-                            PttNeonGreen.copy(alpha = 0.45f * rxPulse)
+                        width = if (slotGlow > 0.05f) 1.dp else 0.8.dp,
+                        color = if (slotGlow > 0.05f) {
+                            PttNeonGreen.copy(alpha = (0.22f + 0.78f * slotGlow).coerceIn(0f, 1f))
                         } else {
                             Color(0xFF313944)
                         },

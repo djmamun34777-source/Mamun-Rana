@@ -30,10 +30,11 @@ private const val FOCUS_TAG = "WalkieAudioFocus"
  * Layers:
  * 1. [AudioManager.OnAudioFocusChangeListener] — immediate reaction to transient/permanent focus loss.
  * 2. [AudioManager.AudioRecordingCallback] (API 24+) — detects third-party VoIP apps acquiring the mic
- *    and detects the exact moment they release the mic when the call ends.
+ *    (without false-positive self-detection against our own WebRTC AudioRecord) and detects the exact
+ *    moment the external app releases the mic when the call ends.
  * 3. [AudioManager.OnModeChangedListener] (API 31+) — detects MODE_IN_CALL / MODE_RINGTONE / MODE_NORMAL.
  * 4. Recovery Watcher — while suspended for an external call, monitors mode + active recordings and
- *    automatically reclaims AudioFocus & hardware microphone 1.2s after the external call ends.
+ *    automatically reclaims AudioFocus & hardware microphone as soon as the external call ends.
  */
 class WalkieAudioFocusManager(
     context: Context,
@@ -57,6 +58,9 @@ class WalkieAudioFocusManager(
 
     @Volatile
     var ownPttActive: Boolean = false
+
+    @Volatile
+    var ownAudioCaptureActive: Boolean = false
 
     private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         when (focusChange) {
@@ -195,23 +199,28 @@ class WalkieAudioFocusManager(
         }
     }
 
+    /**
+     * Accurately distinguishes genuine third-party microphone usage (IMO/WhatsApp/Messenger/Phone)
+     * from our own WebRTC AudioRecord session so the app NEVER self-triggers an external call pause.
+     */
     private fun hasThirdPartyRecording(configs: List<AudioRecordingConfiguration>): Boolean {
         if (configs.isEmpty()) return false
-        // If we are NOT holding PTT, any active voice/communication recording config belongs to another app
-        // (unless our own standby capture is muted). If another app starts a call, its audioSource is
-        // VOICE_COMMUNICATION / VOICE_CALL / MIC and often silences or supersedes our session.
-        if (ownPttActive) {
-            // If >1 recording sessions exist while we press PTT, another app is also grabbing the mic
-            return configs.size > 1
-        }
-        return configs.any { cfg ->
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // If another app owns an active non-silenced recording while we are idle, release our mic!
-                !cfg.isClientSilenced
-            } else {
-                true
+
+        // On Android 10+, if Android silenced an active recording client, another higher-priority
+        // app (like a phone or VoIP call) has preempted the microphone!
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (configs.any { it.isClientSilenced }) {
+                return true
             }
         }
+
+        // If more than 1 recording session is active at the same time, another app is using the mic
+        if (configs.size > 1) return true
+
+        // Exactly 1 active recording config: if our own app is NOT holding an AudioRecord right now
+        // (e.g. standby without peers, or already suspended during recovery polling), that 1 config
+        // definitely belongs to a third-party app!
+        return !ownAudioCaptureActive && !ownPttActive
     }
 
     fun isExternalPhoneCallActive(): Boolean {
@@ -304,6 +313,10 @@ class WalkieAudioFocusManager(
                 audioManager.mode = AudioManager.MODE_NORMAL
             }
         }
+    }
+
+    fun refreshSystemVolume() {
+        _volumePercent.value = readSystemVolumePercent()
     }
 
     fun readSystemVolumePercent(): Int {

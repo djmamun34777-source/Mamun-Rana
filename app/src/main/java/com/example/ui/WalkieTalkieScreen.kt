@@ -196,6 +196,7 @@ fun WalkieTalkieScreen(
                         RuggedWalkieTopHeader(
                             isTransmitting = state.isTransmitting,
                             isPoweredOn = state.isPoweredOn,
+                            localAudioLevel = state.audioTelemetry.localAudioLevel,
                             onTopKnobClick = { viewModel.channelUp() }
                         )
 
@@ -298,12 +299,15 @@ fun WalkieTalkieScreen(
                                         privateTargetName = state.privateTargetName,
                                         onlineInChannel = state.onlineInActiveChannelCount,
                                         batteryPercent = state.batteryPercent,
+                                        isCharging = state.isCharging,
                                         signalBars = state.signalBars,
                                         networkTransport = state.networkTransport,
                                         isTransmitting = state.isTransmitting,
                                         activeSpeakerName = state.activeSpeakerName,
                                         isChannelBusyByOther = state.isChannelBusyByOther,
                                         micPermissionGranted = state.micPermissionGranted,
+                                        localAudioLevel = state.audioTelemetry.localAudioLevel,
+                                        remoteAudioLevel = state.audioTelemetry.remoteAudioLevel,
                                         modifier = Modifier.weight(1f)
                                     )
                                 }
@@ -324,6 +328,7 @@ fun WalkieTalkieScreen(
 
                                     AcousticSpeakerGrill(
                                         isReceivingAudio = state.isChannelBusyByOther || state.audioTelemetry.receivingAudio,
+                                        remoteAudioLevel = state.audioTelemetry.remoteAudioLevel,
                                         isPoweredOn = state.isPoweredOn,
                                         modifier = Modifier.weight(1f)
                                     )
@@ -406,7 +411,7 @@ fun WalkieTalkieScreen(
                 onSelectGroupChannel = { viewModel.selectGroupChannel(it) },
                 onStartPrivateMode = { viewModel.startPrivateModeWith(it) },
                 onCopiedDeviceId = {
-                    activeOverlay = WalkieOverlay.NONE
+                    viewModel.notifyUser("Device ID (${state.myDeviceId}) copied to clipboard")
                 },
                 onDismiss = { activeOverlay = WalkieOverlay.NONE }
             )
@@ -425,8 +430,8 @@ fun WalkieTalkieScreen(
                 onRenameDevice = { dev, name -> viewModel.renameDevice(dev, name) },
                 onRenameChannel = { ch, name -> viewModel.renameChannel(ch, name) },
                 onClearChannelFloor = { viewModel.clearChannelFloorAsAdmin(it) },
-                onSaveIceConfig = { stun, turn, user, pass, sfuEn, sfuUrl ->
-                    viewModel.saveIceServerConfig(stun, turn, user, pass, sfuEn, sfuUrl)
+                onSaveIceConfig = { stun, turn, user, pass ->
+                    viewModel.saveIceServerConfig(stun, turn, user, pass)
                 },
                 onKeepActiveInBackgroundToggle = { viewModel.setKeepActiveInBackground(it) },
                 onAutoStartOnBootToggle = { viewModel.setAutoStartOnBoot(it) },

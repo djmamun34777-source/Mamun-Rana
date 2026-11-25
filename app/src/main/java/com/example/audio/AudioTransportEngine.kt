@@ -6,21 +6,19 @@ import com.example.data.WalkieDevice
 import com.example.data.WebRtcSignal
 import kotlinx.coroutines.flow.StateFlow
 
-enum class AudioTransportTopology {
-    MESH_P2P,
-    SFU_READY
-}
-
 data class PeerAudioTelemetry(
     val connectedPeerIds: Set<String> = emptySet(),
     val activeRoomId: String = "",
     val transmitting: Boolean = false,
     val receivingAudio: Boolean = false,
+    val localAudioLevel: Float = 0f,
+    val remoteAudioLevel: Float = 0f,
+    val iceConnectionLabel: String = "STANDBY",
+    val hasActiveAudioCapture: Boolean = false,
     val hardwareMicReleasedForCall: Boolean = false,
     val iceReady: Boolean = false,
     val stunCount: Int = 0,
     val turnConfigured: Boolean = false,
-    val topology: AudioTransportTopology = AudioTransportTopology.MESH_P2P,
     val lastError: String? = null
 )
 
@@ -39,9 +37,8 @@ interface SignalingSender {
 }
 
 /**
- * Abstraction for real-time audio transport.
- * Currently backed by [WebRtcMeshAudioEngine] for 2-6 devices, with built-in SFU configuration hook
- * and full hardware microphone release/reclaim for third-party VoIP/SIM calls.
+ * Abstraction for real-time WebRTC mesh audio transport (up to 6 family devices),
+ * live PCM/RTP audio-level telemetry, and full hardware mic release/reclaim for external calls.
  */
 interface AudioTransportEngine {
     val telemetry: StateFlow<PeerAudioTelemetry>

@@ -117,15 +117,15 @@ fun EmailOtpVerificationScreen(
 
             when (val res = otpManager.sendOtpToGoogleEmail(user)) {
                 is OtpSendResult.Sent -> {
-                    statusHeadline = "OTP SENT • CHECK GMAIL"
-                    infoMessage = "6-digit OTP sent to ${res.email}. Open Gmail, copy the code, and paste it below."
+                    statusHeadline = "OTP SENT VIA ${res.providerLabel.uppercase()}"
+                    infoMessage = "Real 6-digit OTP sent via ${res.providerLabel} to ${res.email}. Open Gmail, copy the code, and paste it below."
                     resendCooldownSec = 60
                 }
 
                 is OtpSendResult.EmailServiceNotConfigured -> {
-                    statusHeadline = "EMAIL API KEY REQUIRED"
+                    statusHeadline = "GOOGLE GMAIL SMTP SETUP REQUIRED"
                     needsEmailApiSetup = true
-                    errorMessage = "Add RESEND_API_KEY in the AI Studio Secrets panel to deliver real OTP emails to ${res.email}, then tap Resend OTP."
+                    errorMessage = "To receive real OTP emails from Google Gmail at ${res.email}, add GMAIL_SMTP_EMAIL and a 16-char GMAIL_SMTP_APP_PASSWORD (from myaccount.google.com/apppasswords) in the AI Studio Secrets panel, then rebuild & tap Resend OTP."
                 }
 
                 is OtpSendResult.Error -> {

@@ -91,7 +91,7 @@ fun AdminAndSettingsOverlay(
     onRenameDevice: (WalkieDevice, String) -> Unit,
     onRenameChannel: (Int, String) -> Unit,
     onClearChannelFloor: (Int) -> Unit,
-    onSaveIceConfig: (String, String, String, String, Boolean, String) -> Unit,
+    onSaveIceConfig: (String, String, String, String) -> Unit,
     onKeepActiveInBackgroundToggle: (Boolean) -> Unit,
     onAutoStartOnBootToggle: (Boolean) -> Unit,
     onRequestMicPermission: () -> Unit,
@@ -116,8 +116,6 @@ fun AdminAndSettingsOverlay(
     var turnUrl by remember(state.iceConfig.turnUrl) { mutableStateOf(state.iceConfig.turnUrl) }
     var turnUser by remember(state.iceConfig.turnUsername) { mutableStateOf(state.iceConfig.turnUsername) }
     var turnPass by remember(state.iceConfig.turnCredential) { mutableStateOf(state.iceConfig.turnCredential) }
-    var sfuEnabled by remember(state.iceConfig.sfuEnabled) { mutableStateOf(state.iceConfig.sfuEnabled) }
-    var sfuUrl by remember(state.iceConfig.sfuUrl) { mutableStateOf(state.iceConfig.sfuUrl) }
 
     Column(
         modifier = Modifier
@@ -193,7 +191,7 @@ fun AdminAndSettingsOverlay(
                         }
                         Spacer(Modifier.height(10.dp))
 
-                        // Live STUN / TURN + Mic Telemetry Chips
+                        // Live STUN / TURN + Mic + Real WebRTC Peer/ICE Telemetry Chips
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -213,6 +211,27 @@ fun AdminAndSettingsOverlay(
                                     state.isCallInterrupted -> BrandAmber
                                     state.micPermissionGranted -> StatusOnlineGreen
                                     else -> StatusDangerRed
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            val livePeers = state.audioTelemetry.connectedPeerIds.size
+                            StatusMiniChip(
+                                label = "WEBRTC PEERS: $livePeers",
+                                color = if (livePeers > 0) StatusOnlineGreen else TextSecondaryLight,
+                                modifier = Modifier.weight(1f)
+                            )
+                            StatusMiniChip(
+                                label = "ICE: ${state.audioTelemetry.iceConnectionLabel}",
+                                color = when (state.audioTelemetry.iceConnectionLabel) {
+                                    "P2P DIRECT", "TURN RELAY", "ICE LIVE" -> StatusOnlineGreen
+                                    "ICE CHECKING" -> BrandAmber
+                                    else -> TextSecondaryLight
                                 },
                                 modifier = Modifier.weight(1f)
                             )
@@ -564,7 +583,7 @@ fun AdminAndSettingsOverlay(
                     }
                 }
 
-                // WebRTC STUN / TURN & Future SFU Configuration
+                // WebRTC STUN / TURN Configuration
                 item {
                     Card(
                         colors = CardDefaults.cardColors(containerColor = GunmetalCard),
@@ -578,7 +597,7 @@ fun AdminAndSettingsOverlay(
                                 Icon(Icons.Default.Router, null, tint = PttNeonGreen, modifier = Modifier.size(20.dp))
                                 Spacer(Modifier.width(8.dp))
                                 Text(
-                                    text = "WEBRTC STUN / TURN & SFU CONFIG",
+                                    text = "WEBRTC STUN / TURN NETWORK CONFIG",
                                     fontFamily = OrbitronFontFamily,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 12.sp,
@@ -586,7 +605,7 @@ fun AdminAndSettingsOverlay(
                                 )
                             }
                             Text(
-                                text = "Pre-configured out-of-the-box with 5 multi-region STUN servers + multi-transport OpenRelay TURN (UDP/TCP/TLS 443) for Wi-Fi & Mobile Data NAT traversal. You can override with your own TURN/SFU below anytime.",
+                                text = "Pre-configured out-of-the-box with 5 multi-region STUN servers + multi-transport OpenRelay TURN (UDP/TCP/TLS 443) for Wi-Fi & Mobile Data NAT traversal. You can override with your own TURN credentials below anytime.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = TextSecondaryLight
                             )
@@ -619,24 +638,9 @@ fun AdminAndSettingsOverlay(
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth()
                             )
-                            PreferenceSwitchRow(
-                                title = "Future SFU Routing Mode",
-                                subtitle = "Enable when connecting a dedicated SFU relay server",
-                                checked = sfuEnabled,
-                                onCheckedChange = { sfuEnabled = it }
-                            )
-                            if (sfuEnabled) {
-                                OutlinedTextField(
-                                    value = sfuUrl,
-                                    onValueChange = { sfuUrl = it },
-                                    label = { Text("SFU Endpoint URL (wss://...)") },
-                                    singleLine = true,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                            }
                             Button(
                                 onClick = {
-                                    onSaveIceConfig(stunText, turnUrl, turnUser, turnPass, sfuEnabled, sfuUrl)
+                                    onSaveIceConfig(stunText, turnUrl, turnUser, turnPass)
                                 },
                                 enabled = !state.isBusySaving,
                                 colors = ButtonDefaults.buttonColors(
@@ -647,7 +651,7 @@ fun AdminAndSettingsOverlay(
                                     .fillMaxWidth()
                                     .testTag("save_ice_config_button")
                             ) {
-                                Text("Save STUN / TURN / SFU Config", fontWeight = FontWeight.Bold)
+                                Text("Save STUN / TURN Config", fontWeight = FontWeight.Bold)
                             }
                         }
                     }

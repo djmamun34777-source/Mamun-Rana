@@ -14,12 +14,15 @@ import com.example.data.WalkieDevice
 import com.example.data.WebRtcSignal
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
@@ -34,7 +37,11 @@ import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.audio.JavaAudioDeviceModule
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.sqrt
 
 private const val WEBRTC_TAG = "WebRtcMeshAudioEngine"
 
@@ -42,12 +49,15 @@ private const val WEBRTC_TAG = "WebRtcMeshAudioEngine"
  * Full-Mesh Peer-to-Peer WebRTC Audio Engine for up to 6 family walkie-talkie devices.
  *
  * Key Guarantees:
- * 1. Pre-configured multi-region STUN + OpenRelay TURN (UDP/TCP/TLS) with live Admin override.
+ * 1. Pre-configured multi-region STUN + OpenRelay TURN (UDP/TCP/TLS 443) with live Admin override.
  * 2. Strict Push-to-Talk microphone privacy: mic remains muted/disabled unless PTT is held.
- * 3. True Hardware Microphone Release on third-party calls (IMO, WhatsApp, Messenger, SIM):
+ * 3. Real Live Audio Metering:
+ *    - TX level is computed directly from real hardware PCM microphone samples in [JavaAudioDeviceModule.SamplesReadyCallback].
+ *    - RX level & active ICE route (`P2P DIRECT` vs `TURN RELAY`) are read directly from WebRTC [PeerConnection.getStats].
+ * 4. True Hardware Microphone Release on third-party calls (IMO, WhatsApp, Messenger, SIM):
  *    [suspendHardwareAudioForExternalCall] detaches & disposes local AudioTrack/AudioSource and
  *    mutes speaker/mic hardware so Android completely releases AudioRecord to the calling app.
- * 4. Automatic Hardware Reclaim: [resumeHardwareAudioAfterExternalCall] recreates local audio
+ * 5. Automatic Hardware Reclaim: [resumeHardwareAudioAfterExternalCall] recreates local audio
  *    capture & re-attaches tracks to active peers seamlessly once the external call ends.
  */
 class WebRtcMeshAudioEngine(
@@ -67,8 +77,13 @@ class WebRtcMeshAudioEngine(
     private var currentIceConfig: IceServerConfig = IceServerConfig()
     private var activeRoomId: String = ""
     private var isInitialized = false
+    @Volatile
     private var isTransmitting = false
+    @Volatile
     private var isHardwareSuspendedForCall = false
+
+    private val lastLocalMeterUpdateMs = AtomicLong(0L)
+    private var statsPollerJob: Job? = null
 
     private data class PeerSession(
         val remoteDeviceId: String,
@@ -98,6 +113,20 @@ class WebRtcMeshAudioEngine(
             val adm = JavaAudioDeviceModule.builder(context.applicationContext)
                 .setUseHardwareAcousticEchoCanceler(true)
                 .setUseHardwareNoiseSuppressor(true)
+                .setSamplesReadyCallback { audioSamples ->
+                    if (!isTransmitting || isHardwareSuspendedForCall) {
+                        if (_telemetry.value.localAudioLevel > 0f) {
+                            _telemetry.update { it.copy(localAudioLevel = 0f) }
+                        }
+                        return@setSamplesReadyCallback
+                    }
+                    val now = System.currentTimeMillis()
+                    if (now - lastLocalMeterUpdateMs.get() < 60L) return@setSamplesReadyCallback
+                    lastLocalMeterUpdateMs.set(now)
+
+                    val level = computePcm16RmsLevel(audioSamples.data)
+                    _telemetry.update { it.copy(localAudioLevel = level) }
+                }
                 .setAudioRecordErrorCallback(object : JavaAudioDeviceModule.AudioRecordErrorCallback {
                     override fun onWebRtcAudioRecordInitError(errorMessage: String?) {
                         Log.e(WEBRTC_TAG, "AudioRecord init error: $errorMessage")
@@ -143,10 +172,7 @@ class WebRtcMeshAudioEngine(
             factory = pcFactory
             isInitialized = true
 
-            if (!isHardwareSuspendedForCall) {
-                createLocalAudioCapture(pcFactory)
-            }
-
+            // Keep AudioRecord idle until peers or PTT actually need it so standby does not grab mic needlessly
             updateTelemetryForIce(currentIceConfig)
         } catch (t: Throwable) {
             Log.e(WEBRTC_TAG, "Failed to initialize WebRTC PeerConnectionFactory", t)
@@ -167,9 +193,17 @@ class WebRtcMeshAudioEngine(
         }
         val source = pcFactory.createAudioSource(audioConstraints)
         val track = pcFactory.createAudioTrack("mamun_ptt_audio_track_${System.currentTimeMillis()}", source)
-        track.setEnabled(false)
+        track.setEnabled(isTransmitting && !isHardwareSuspendedForCall)
         localAudioSource = source
         localAudioTrack = track
+        updateCaptureFlag()
+    }
+
+    private fun updateCaptureFlag() {
+        val activeCapture = !isHardwareSuspendedForCall &&
+            localAudioTrack != null &&
+            (isTransmitting || peers.isNotEmpty())
+        _telemetry.update { it.copy(hasActiveAudioCapture = activeCapture) }
     }
 
     override fun updateIceConfig(iceConfig: IceServerConfig) {
@@ -186,11 +220,6 @@ class WebRtcMeshAudioEngine(
                 iceReady = isInitialized && iceServers.isNotEmpty(),
                 stunCount = stunCount,
                 turnConfigured = hasTurn,
-                topology = if (config.sfuEnabled && config.sfuUrl.isNotBlank()) {
-                    AudioTransportTopology.SFU_READY
-                } else {
-                    AudioTransportTopology.MESH_P2P
-                },
                 lastError = null
             )
         }
@@ -236,7 +265,9 @@ class WebRtcMeshAudioEngine(
             }
         }
 
+        updateCaptureFlag()
         refreshConnectedTelemetry()
+        ensureStatsPollerState()
     }
 
     override fun handleIncomingSignal(
@@ -252,7 +283,9 @@ class WebRtcMeshAudioEngine(
         when (signal.type) {
             SignalType.BYE -> {
                 closePeer(signal.fromDeviceId)
+                updateCaptureFlag()
                 refreshConnectedTelemetry()
+                ensureStatsPollerState()
             }
 
             SignalType.OFFER -> {
@@ -264,6 +297,9 @@ class WebRtcMeshAudioEngine(
                     remoteUid = signal.fromUid,
                     signalingSender = signalingSender
                 )?.also { peers[signal.fromDeviceId] = it } ?: return
+
+                updateCaptureFlag()
+                ensureStatsPollerState()
 
                 val offerDesc = SessionDescription(SessionDescription.Type.OFFER, signal.sdp)
                 session.peerConnection.setRemoteDescription(object : SimpleSdpObserver("setRemoteOffer") {
@@ -332,7 +368,8 @@ class WebRtcMeshAudioEngine(
     override fun setTransmitting(active: Boolean) {
         if (isHardwareSuspendedForCall) {
             isTransmitting = false
-            _telemetry.update { it.copy(transmitting = false) }
+            _telemetry.update { it.copy(transmitting = false, localAudioLevel = 0f) }
+            updateCaptureFlag()
             return
         }
         isTransmitting = active
@@ -345,7 +382,13 @@ class WebRtcMeshAudioEngine(
                 localAudioTrack?.setEnabled(false)
                 audioDeviceModule?.setMicrophoneMute(true)
             }
-            _telemetry.update { it.copy(transmitting = active) }
+            _telemetry.update {
+                it.copy(
+                    transmitting = active,
+                    localAudioLevel = if (active) it.localAudioLevel else 0f
+                )
+            }
+            updateCaptureFlag()
         } catch (t: Throwable) {
             Log.e(WEBRTC_TAG, "Error toggling PTT transmission", t)
         }
@@ -367,7 +410,6 @@ class WebRtcMeshAudioEngine(
             audioDeviceModule?.setMicrophoneMute(true)
             audioDeviceModule?.setSpeakerMute(true)
 
-            // Detach local audio track from every peer RTP sender so native AudioRecord stops completely
             peers.values.forEach { session ->
                 session.peerConnection.senders.forEach { sender ->
                     if (sender.track()?.kind() == org.webrtc.MediaStreamTrack.AUDIO_TRACK_KIND) {
@@ -379,7 +421,6 @@ class WebRtcMeshAudioEngine(
                 }
             }
 
-            // Dispose local AudioTrack & AudioSource to guarantee hardware AudioRecord handle release
             localAudioTrack?.dispose()
             localAudioSource?.dispose()
             localAudioTrack = null
@@ -391,6 +432,10 @@ class WebRtcMeshAudioEngine(
         _telemetry.update {
             it.copy(
                 transmitting = false,
+                receivingAudio = false,
+                localAudioLevel = 0f,
+                remoteAudioLevel = 0f,
+                hasActiveAudioCapture = false,
                 hardwareMicReleasedForCall = true
             )
         }
@@ -408,7 +453,7 @@ class WebRtcMeshAudioEngine(
 
         runCatching {
             val pcFactory = factory
-            if (pcFactory != null) {
+            if (pcFactory != null && peers.isNotEmpty()) {
                 createLocalAudioCapture(pcFactory)
                 val freshTrack = localAudioTrack
                 peers.values.forEach { session ->
@@ -431,7 +476,6 @@ class WebRtcMeshAudioEngine(
                     }
                 }
             }
-            // Keep mic muted until PTT is pressed, restore speaker for incoming voice
             audioDeviceModule?.setMicrophoneMute(true)
             audioDeviceModule?.setSpeakerMute(false)
         }.onFailure { err ->
@@ -441,6 +485,8 @@ class WebRtcMeshAudioEngine(
         _telemetry.update {
             it.copy(hardwareMicReleasedForCall = false)
         }
+        updateCaptureFlag()
+        ensureStatsPollerState()
     }
 
     @Synchronized
@@ -472,11 +518,15 @@ class WebRtcMeshAudioEngine(
             }
         }
         activeRoomId = ""
+        updateCaptureFlag()
         refreshConnectedTelemetry()
+        ensureStatsPollerState()
     }
 
     @Synchronized
     override fun release() {
+        statsPollerJob?.cancel()
+        statsPollerJob = null
         disconnectAll(sendBye = false, myDeviceId = "", signalingSender = null)
         try {
             localAudioTrack?.dispose()
@@ -491,6 +541,119 @@ class WebRtcMeshAudioEngine(
         factory = null
         isInitialized = false
         scope.cancel()
+    }
+
+    private fun ensureStatsPollerState() {
+        if (peers.isEmpty() || isHardwareSuspendedForCall) {
+            statsPollerJob?.cancel()
+            statsPollerJob = null
+            _telemetry.update {
+                it.copy(
+                    remoteAudioLevel = 0f,
+                    receivingAudio = false,
+                    iceConnectionLabel = if (peers.isEmpty()) "STANDBY" else it.iceConnectionLabel
+                )
+            }
+            return
+        }
+        if (statsPollerJob?.isActive == true) return
+        statsPollerJob = scope.launch {
+            while (isActive && peers.isNotEmpty() && !isHardwareSuspendedForCall) {
+                pollRealWebRtcStats()
+                delay(220L)
+            }
+        }
+    }
+
+    private fun pollRealWebRtcStats() {
+        val activeSessions = peers.values.toList()
+        if (activeSessions.isEmpty()) return
+
+        var maxRemoteLevel = 0f
+        var sawRelayRoute = false
+        var sawDirectRoute = false
+
+        activeSessions.forEach { session ->
+            runCatching {
+                session.peerConnection.getStats { report ->
+                    var peerRemoteLevel = 0f
+                    val localCandidateTypes = HashMap<String, String>()
+                    var activeLocalCandidateId: String? = null
+
+                    report.statsMap.values.forEach { stat ->
+                        when (stat.type) {
+                            "inbound-rtp" -> {
+                                val kind = stat.members["kind"] as? String ?: stat.members["mediaType"] as? String
+                                if (kind == "audio") {
+                                    val levelNum = stat.members["audioLevel"] as? Number
+                                    if (levelNum != null) {
+                                        val lvl = levelNum.toFloat().coerceIn(0f, 1f)
+                                        if (lvl > peerRemoteLevel) peerRemoteLevel = lvl
+                                    }
+                                }
+                            }
+
+                            "local-candidate" -> {
+                                val cType = stat.members["candidateType"] as? String
+                                if (cType != null) {
+                                    localCandidateTypes[stat.id] = cType
+                                }
+                            }
+
+                            "candidate-pair" -> {
+                                val state = stat.members["state"] as? String
+                                val nominated = stat.members["nominated"] as? Boolean ?: false
+                                if (state == "succeeded" && nominated) {
+                                    activeLocalCandidateId = stat.members["localCandidateId"] as? String
+                                }
+                            }
+                        }
+                    }
+
+                    val selectedType = activeLocalCandidateId?.let { localCandidateTypes[it] }
+                    if (selectedType.equals("relay", ignoreCase = true)) {
+                        sawRelayRoute = true
+                    } else if (!selectedType.isNullOrBlank()) {
+                        sawDirectRoute = true
+                    }
+
+                    if (peerRemoteLevel > maxRemoteLevel) {
+                        maxRemoteLevel = peerRemoteLevel
+                    }
+
+                    val currentConnected = _telemetry.value.connectedPeerIds
+                    val routeLabel = when {
+                        sawRelayRoute -> "TURN RELAY"
+                        sawDirectRoute -> "P2P DIRECT"
+                        currentConnected.isNotEmpty() -> "ICE LIVE"
+                        peers.isNotEmpty() -> "ICE CHECKING"
+                        else -> "STANDBY"
+                    }
+
+                    _telemetry.update {
+                        it.copy(
+                            remoteAudioLevel = maxRemoteLevel,
+                            receivingAudio = maxRemoteLevel > 0.015f && !isHardwareSuspendedForCall,
+                            iceConnectionLabel = routeLabel
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun computePcm16RmsLevel(pcmBytes: ByteArray): Float {
+        if (pcmBytes.size < 2) return 0f
+        val shortCount = pcmBytes.size / 2
+        val buf = ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN)
+        var sumSq = 0.0
+        for (i in 0 until shortCount) {
+            val sample = buf.short.toDouble() / 32768.0
+            sumSq += sample * sample
+        }
+        val rms = sqrt(sumSq / shortCount.coerceAtLeast(1))
+        // Amplify human speech RMS (~0.02..0.28) cleanly into 0.0..1.0 meter scale
+        return ((rms * 4.2).toFloat()).coerceIn(0f, 1f)
     }
 
     private fun createPeerSession(
@@ -518,7 +681,9 @@ class WebRtcMeshAudioEngine(
             }
 
             override fun onIceConnectionReceivingChange(receiving: Boolean) {
-                _telemetry.update { it.copy(receivingAudio = receiving && !isHardwareSuspendedForCall) }
+                if (!receiving) {
+                    _telemetry.update { it.copy(receivingAudio = false, remoteAudioLevel = 0f) }
+                }
             }
 
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) = Unit
@@ -632,7 +797,23 @@ class WebRtcMeshAudioEngine(
             }
             .map { it.remoteDeviceId }
             .toSet()
-        _telemetry.update { it.copy(connectedPeerIds = connected, activeRoomId = activeRoomId) }
+
+        val label = when {
+            connected.isNotEmpty() -> {
+                val prev = _telemetry.value.iceConnectionLabel
+                if (prev == "TURN RELAY" || prev == "P2P DIRECT") prev else "ICE LIVE"
+            }
+            peers.isNotEmpty() -> "ICE CHECKING"
+            else -> "STANDBY"
+        }
+
+        _telemetry.update {
+            it.copy(
+                connectedPeerIds = connected,
+                activeRoomId = activeRoomId,
+                iceConnectionLabel = label
+            )
+        }
     }
 
     private fun normalizeIceConfig(config: IceServerConfig): IceServerConfig {
@@ -655,8 +836,6 @@ class WebRtcMeshAudioEngine(
         }
         if (config.turnUrl.isNotBlank()) {
             val urls = mutableListOf(config.turnUrl)
-            // When using pre-configured OpenRelay TURN, also register UDP:80 + TCP:443 + TLS:443
-            // so strict mobile carrier NATs and restrictive Wi-Fi firewalls connect reliably.
             if (config.turnUrl.contains("openrelay.metered.ca", ignoreCase = true)) {
                 val extra = listOf(
                     "turn:openrelay.metered.ca:80",
